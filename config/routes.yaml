@@ -84,6 +84,20 @@ routes:
       passThrough: ["query.term", "query.cond", "query.intr", filter.overallStatus, pageSize, pageToken, sort]
       timeoutSeconds: 20
 
+  # --- Jack Kruse / Quantum Biology ---
+
+  - id: kruse-search
+    path: /research/kruse/search
+    method: GET
+    description: "Search 460 Dr. Jack Kruse blog posts on quantum biology, mitochondria, light, cold thermogenesis, circadian rhythm, DHA, EMF, leptin. Keyword + semantic + hybrid search."
+    price: "0.002"
+    cacheTtlSeconds: 1800
+    upstream:
+      baseUrl: http://localhost:8765
+      path: /search
+      passThrough: [q, mode, limit]
+      timeoutSeconds: 10
+
   # --- Chemistry / Compounds ---
 
   - id: pubchem-compound
