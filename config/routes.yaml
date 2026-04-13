@@ -93,7 +93,7 @@ routes:
     price: "0.002"
     cacheTtlSeconds: 1800
     upstream:
-      baseUrl: http://localhost:8765
+      baseUrl: ${KRUSE_SEARCH_URL:-http://localhost:8765}
       path: /search
       passThrough: [q, mode, limit]
       timeoutSeconds: 10
