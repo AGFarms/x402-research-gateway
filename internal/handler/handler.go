@@ -306,28 +306,13 @@ func (h *Handler) handlePaymentAndProxy(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// Payment verified! Settle best-effort (non-blocking for resource access).
-	var txHash string
-	go func() {
-		settleReq := map[string]interface{}{
-			"x402Version":         1,
-			"paymentPayload":      v1PaymentPayload,
-			"paymentRequirements": v1Requirements,
-		}
-		settleBody, err := json.Marshal(settleReq)
-		if err != nil {
-			slog.Error("Failed to marshal settle request", "error", err)
-			return
-		}
-		settleResp, err := http.Post(h.cfg.FacilitatorURL+"/settle", "application/json", bytes.NewReader(settleBody))
-		if err != nil {
-			slog.Warn("Facilitator settle failed (non-blocking)", "error", err)
-			return
-		}
-		defer settleResp.Body.Close()
-		settleRespBody, _ := io.ReadAll(settleResp.Body)
-		slog.Info("Facilitator settle response", "status", settleResp.StatusCode, "body", string(settleRespBody))
-	}()
+	// Payment verified! Settle with a bounded synchronous wait so we can
+	// carry a real on-chain tx hash in the feed402 envelope's receipt.tx.
+	// If settle exceeds the budget (facilitator slow / chain congestion),
+	// we continue the settle in the background and fall back to the
+	// "pending:<hash>" placeholder for this response — the payment is
+	// still valid, the receipt is just non-final until the next call.
+	txHash := h.settleWithTimeout(r.Context(), v1PaymentPayload, v1Requirements, 3*time.Second)
 
 	slog.Info("Payment verified, proxying to upstream",
 		"route", route.ID,
@@ -388,6 +373,111 @@ func (h *Handler) returnPaymentError(w http.ResponseWriter, r *http.Request, _ s
 		}
 	}
 	w.WriteHeader(http.StatusPaymentRequired)
+}
+
+// settleWithTimeout calls the facilitator /settle endpoint with a bounded
+// deadline and returns the on-chain tx hash on success. On timeout or any
+// failure we kick the settle call into the background (best-effort) and
+// return "" — the caller will then emit a placeholder receipt.tx.
+func (h *Handler) settleWithTimeout(
+	parent context.Context,
+	paymentPayload map[string]interface{},
+	requirements map[string]interface{},
+	budget time.Duration,
+) string {
+	settleReq := map[string]interface{}{
+		"x402Version":         1,
+		"paymentPayload":      paymentPayload,
+		"paymentRequirements": requirements,
+	}
+	settleBody, err := json.Marshal(settleReq)
+	if err != nil {
+		slog.Error("Failed to marshal settle request", "error", err)
+		return ""
+	}
+
+	type settleOutcome struct {
+		status int
+		body   []byte
+		err    error
+	}
+	resultCh := make(chan settleOutcome, 1)
+
+	// Detach from the request context so the background fallback survives
+	// past the response being written.
+	bgCtx, bgCancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+	go func() {
+		defer bgCancel()
+		req, rerr := http.NewRequestWithContext(bgCtx, "POST",
+			h.cfg.FacilitatorURL+"/settle", bytes.NewReader(settleBody))
+		if rerr != nil {
+			resultCh <- settleOutcome{err: rerr}
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, rerr := http.DefaultClient.Do(req)
+		if rerr != nil {
+			resultCh <- settleOutcome{err: rerr}
+			return
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		resultCh <- settleOutcome{status: resp.StatusCode, body: body}
+	}()
+
+	waitCtx, waitCancel := context.WithTimeout(parent, budget)
+	defer waitCancel()
+
+	select {
+	case out := <-resultCh:
+		if out.err != nil {
+			slog.Warn("Facilitator settle failed", "error", out.err)
+			return ""
+		}
+		slog.Info("Facilitator settle response", "status", out.status, "body", string(out.body))
+		return extractSettleTxHash(out.body)
+	case <-waitCtx.Done():
+		// Settle still in flight — let it complete in the background and
+		// log the outcome for operator observability.
+		go func() {
+			out := <-resultCh
+			if out.err != nil {
+				slog.Warn("Facilitator settle failed (background)", "error", out.err)
+				return
+			}
+			slog.Info("Facilitator settle response (background)",
+				"status", out.status, "body", string(out.body))
+		}()
+		slog.Warn("Facilitator settle exceeded budget; response will carry placeholder receipt.tx",
+			"budget", budget.String())
+		return ""
+	}
+}
+
+// extractSettleTxHash pulls the on-chain tx hash out of the facilitator
+// /settle response. The x402 facilitator spec isn't strict about the field
+// name in practice, so we accept the common variants ("transaction",
+// "txHash", "tx_hash") and ignore anything else.
+func extractSettleTxHash(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return ""
+	}
+	// Only treat as success if the response self-identifies as successful;
+	// otherwise callers get a misleading "tx" that never landed.
+	if s, ok := m["success"].(bool); ok && !s {
+		return ""
+	}
+	for _, k := range []string{"transaction", "txHash", "tx_hash", "tx"} {
+		if v, ok := m[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -226,6 +226,28 @@ func TestWrapFeed402Envelope_NonJSONBody_StringifiedIntoData(t *testing.T) {
 	}
 }
 
+func TestExtractSettleTxHash(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"transaction field", `{"success":true,"transaction":"0xabc123"}`, "0xabc123"},
+		{"txHash field", `{"success":true,"txHash":"0xdeadbeef"}`, "0xdeadbeef"},
+		{"snake case", `{"success":true,"tx_hash":"0xfeed"}`, "0xfeed"},
+		{"no success flag still accepted", `{"transaction":"0xabc"}`, "0xabc"},
+		{"success false rejected", `{"success":false,"transaction":"0xabc"}`, ""},
+		{"empty body", ``, ""},
+		{"not json", `plaintext`, ""},
+		{"no tx field", `{"success":true,"foo":"bar"}`, ""},
+	}
+	for _, c := range cases {
+		if got := extractSettleTxHash([]byte(c.body)); got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
+}
+
 func TestParsePriceUSD(t *testing.T) {
 	cases := map[string]float64{
 		"0.001": 0.001,
