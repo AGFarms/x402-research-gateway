@@ -100,6 +100,15 @@ func NewHandler(cfg *config.GatewayConfig) *Handler {
 	// Health endpoint (free)
 	h.router.Get("/health", h.handleHealth)
 
+	// feed402 discovery manifest (free) — only mounted when enabled.
+	if cfg.Feed402.Enabled {
+		h.router.Get("/.well-known/feed402.json", h.handleFeed402Manifest)
+		slog.Info("feed402 compliance layer active",
+			"spec", cfg.Feed402.Spec,
+			"manifest", "/.well-known/feed402.json",
+		)
+	}
+
 	// Register all configured research routes
 	for i := range cfg.Routes {
 		r := &cfg.Routes[i]
@@ -344,8 +353,24 @@ func (h *Handler) handlePaymentAndProxy(w http.ResponseWriter, r *http.Request, 
 	if txHash != "" {
 		w.Header().Set("X-Research-Transaction", txHash)
 	}
+
+	// feed402 compliance: wrap the upstream body in the §3 envelope
+	// (data + citation + receipt). Only on 2xx; pass through error bodies
+	// unchanged so agents still see useful upstream error messages.
+	respBody := result.Body
+	if h.cfg.Feed402.Enabled && result.StatusCode >= 200 && result.StatusCode < 300 {
+		wrapped, werr := h.wrapFeed402Envelope(route, result.Body, verifyResult.Payer, txHash, r)
+		if werr != nil {
+			slog.Warn("feed402 envelope wrap failed, returning raw upstream body",
+				"route", route.ID, "error", werr)
+		} else {
+			respBody = wrapped
+			w.Header().Set("X-Feed402-Spec", h.cfg.Feed402.Spec)
+		}
+	}
+
 	w.WriteHeader(result.StatusCode)
-	_, _ = w.Write(result.Body)
+	_, _ = w.Write(respBody)
 }
 
 // returnPaymentError sends a 402 with fresh payment requirements.
