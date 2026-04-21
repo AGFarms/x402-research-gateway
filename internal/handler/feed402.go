@@ -69,12 +69,21 @@ type feed402Manifest struct {
 // ---------- Envelope types (mirror feed402 SPEC §3) ----------
 
 type feed402CitationSource struct {
-	Type         string `json:"type"` // "source"
-	SourceID     string `json:"source_id"`
-	Provider     string `json:"provider"`
-	RetrievedAt  string `json:"retrieved_at"`
-	License      string `json:"license,omitempty"`
-	CanonicalURL string `json:"canonical_url,omitempty"`
+	Type         string                      `json:"type"` // "source"
+	SourceID     string                      `json:"source_id"`
+	Provider     string                      `json:"provider"`
+	RetrievedAt  string                      `json:"retrieved_at"`
+	License      string                      `json:"license,omitempty"`
+	CanonicalURL string                      `json:"canonical_url,omitempty"`
+	ChunkID      string                      `json:"chunk_id,omitempty"`
+	Retrieval    *feed402RetrievalProvenance `json:"retrieval,omitempty"`
+}
+
+// feed402RetrievalProvenance mirrors SPEC §3.2 (v0.2 optional).
+type feed402RetrievalProvenance struct {
+	Model string  `json:"model"`
+	Score float64 `json:"score"`
+	Rank  int     `json:"rank"`
 }
 
 type feed402Receipt struct {

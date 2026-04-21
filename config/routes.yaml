@@ -14,6 +14,19 @@ feed402:
   spec: "feed402/0.2"
   citationPolicy: "mixed"   # per-route licenses below override
   contact: "research@viatika.ai"
+  # feed402 insight-tier endpoint. Synthesizes a short LLM answer over
+  # results from retrievalRouteId. Pricing: cheapest of the three tiers
+  # (SPEC §5). When OPENAI_API_KEY is unset the gateway defaults to the
+  # mock summarizer so it boots without external deps.
+  insight:
+    enabled: true
+    path: /research/insight
+    price: "0.005"
+    description: "Paid LLM-summarized research insight over PubMed retrieval"
+    retrievalRouteId: pubmed-search
+    summarizer: ""          # auto: openai if OPENAI_API_KEY else mock
+    model: gpt-4o-mini
+    maxContextChars: 4000
 
 routes:
   # --- Health / Longevity / Nutrition / Psychedelics / Brain Chemistry ---

@@ -269,6 +269,67 @@ func TestWrapFeed402Envelope_RawTier_NoHits(t *testing.T) {
 	}
 }
 
+func TestMockSummarizer_ProducesDeterministicOutput(t *testing.T) {
+	m := &mockSummarizer{}
+	if !strings.HasPrefix(m.id(), "mock:") {
+		t.Errorf("mock summarizer id: got %q", m.id())
+	}
+	s1, err := m.summarize(nil, "does caloric restriction work?", []string{"a study says yes", "another says maybe"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(s1, "caloric restriction") {
+		t.Errorf("summary should echo question: got %q", s1)
+	}
+	s2, _ := m.summarize(nil, "does caloric restriction work?", []string{"a study says yes", "another says maybe"})
+	if s1 != s2 {
+		t.Errorf("mock summarizer must be deterministic")
+	}
+	empty, _ := m.summarize(nil, "q", nil)
+	if !strings.Contains(empty, "No retrieval context") {
+		t.Errorf("empty-context summary should flag missing context; got %q", empty)
+	}
+}
+
+func TestExtractSnippets_WalksNestedJSON(t *testing.T) {
+	body := []byte(`{"results":[{"title":"Caloric Restriction and Lifespan in Mammals","abstract":"A comprehensive review of multi-decade studies across rodents and primates showing extended healthspan."}]}`)
+	snips := extractSnippets(body, 10_000)
+	if len(snips) < 2 {
+		t.Fatalf("expected at least 2 snippets (title + abstract); got %d", len(snips))
+	}
+	// Cap check.
+	capped := extractSnippets(body, 50)
+	total := 0
+	for _, s := range capped {
+		total += len(s)
+	}
+	if total > 50+200 { // small grace
+		t.Errorf("max chars not honored: got %d", total)
+	}
+}
+
+func TestBuildInsightCitation_UsesTopHitWhenAvailable(t *testing.T) {
+	cfg := testCfg()
+	h := newTestHandler(cfg)
+	h.summarizer = &mockSummarizer{}
+	insightRoute := &config.RouteConfig{ID: "feed402-insight", Citation: config.RouteCitation{SourcePrefix: "insight"}}
+	retRoute := &cfg.Routes[0]
+	hits := []feed402Hit{{SourceID: "pubmed:38831607", CanonicalURL: "https://pubmed.ncbi.nlm.nih.gov/38831607/", Rank: 1}}
+	req := mustReq(t, "https://api.example.com/research/insight")
+	cit := h.buildInsightCitation(insightRoute, retRoute, hits, "caloric restriction", req)
+	if cit.SourceID != "pubmed:38831607" {
+		t.Errorf("source_id should promote top hit; got %q", cit.SourceID)
+	}
+	if cit.CanonicalURL != "https://pubmed.ncbi.nlm.nih.gov/38831607/" {
+		t.Errorf("canonical_url should be top hit's; got %q", cit.CanonicalURL)
+	}
+	// No-hits fallback → synthetic insight source_id.
+	cit2 := h.buildInsightCitation(insightRoute, retRoute, nil, "mitochondria", req)
+	if !strings.HasPrefix(cit2.SourceID, "pubmed:insight:") {
+		t.Errorf("no-hits citation should synthesize prefix:insight:<hash>; got %q", cit2.SourceID)
+	}
+}
+
 func TestExtractSettleTxHash(t *testing.T) {
 	cases := []struct {
 		name string

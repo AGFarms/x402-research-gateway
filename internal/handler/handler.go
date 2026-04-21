@@ -28,6 +28,7 @@ type Handler struct {
 	routeIndex map[string]*config.RouteConfig // "GET /path" -> config
 	httpClient *http.Client
 	hitParsers map[string]hitParser // route.ID -> per-upstream hit extractor
+	summarizer summarizer           // feed402 insight-tier LLM (mock or openai)
 }
 
 // chiHTTPAdapter implements x402http.HTTPAdapter for net/http requests.
@@ -73,6 +74,43 @@ func NewHandler(cfg *config.GatewayConfig) *Handler {
 		routeIndex[key] = r
 	}
 
+	// feed402 insight-tier synthetic route — registered in routeIndex +
+	// x402Routes so the same payment-verify plumbing applies uniformly.
+	if cfg.Feed402.Enabled && cfg.Feed402.Insight.Enabled {
+		ins := cfg.Feed402.Insight
+		insightRoute := &config.RouteConfig{
+			ID:          "feed402-insight",
+			Path:        ins.Path,
+			Method:      "POST",
+			Description: ins.Description,
+			MimeType:    "application/json",
+			Price:       ins.Price,
+			Feed402Tier: "insight",
+			Citation: config.RouteCitation{
+				SourcePrefix: "insight",
+				ProviderURL:  "",
+				License:      cfg.Feed402.CitationPolicy,
+			},
+		}
+		cfg.Routes = append(cfg.Routes, *insightRoute)
+		insKey := "POST " + ins.Path
+		x402Routes[insKey] = x402http.RouteConfig{
+			Description: ins.Description,
+			MimeType:    "application/json",
+			Accepts: x402http.PaymentOptions{
+				{
+					Scheme:            "exact",
+					Network:           network,
+					PayTo:             cfg.RecipientAddress,
+					Price:             ins.Price,
+					MaxTimeoutSeconds: 60,
+				},
+			},
+		}
+		// Pointer into the slot we just appended.
+		routeIndex[insKey] = &cfg.Routes[len(cfg.Routes)-1]
+	}
+
 	x402srv := x402http.NewServer(
 		x402Routes,
 		x402.WithFacilitatorClient(facilitatorClient),
@@ -86,6 +124,9 @@ func NewHandler(cfg *config.GatewayConfig) *Handler {
 		routeIndex: routeIndex,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		hitParsers: defaultHitParsers(),
+	}
+	if cfg.Feed402.Enabled && cfg.Feed402.Insight.Enabled {
+		h.summarizer = newSummarizer(cfg.Feed402.Insight)
 	}
 
 	h.router.Use(chimw.RequestID)
@@ -111,10 +152,16 @@ func NewHandler(cfg *config.GatewayConfig) *Handler {
 		)
 	}
 
-	// Register all configured research routes
+	// Register all configured research routes. The feed402 insight-tier
+	// synthetic route (if enabled) gets its own handler that fans out to
+	// a retrieval route + calls the configured summarizer.
 	for i := range cfg.Routes {
 		r := &cfg.Routes[i]
-		slog.Info("Registering route", "method", r.Method, "path", r.Path, "price", r.Price, "upstream", r.Upstream.BaseURL+r.Upstream.Path)
+		slog.Info("Registering route", "method", r.Method, "path", r.Path, "price", r.Price)
+		if r.ID == "feed402-insight" {
+			h.router.Post(r.Path, h.handleInsight)
+			continue
+		}
 		switch r.Method {
 		case "GET":
 			h.router.Get(r.Path, h.handleProtectedRoute)
@@ -182,143 +229,15 @@ func (h *Handler) handlePaymentAndProxy(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// Decode the base64 payment header
-	paymentBytes, err := base64.StdEncoding.DecodeString(paymentHeader)
-	if err != nil {
-		paymentBytes, err = base64.URLEncoding.DecodeString(paymentHeader)
-		if err != nil {
-			h.returnPaymentError(w, r, "invalid payment header encoding")
-			return
-		}
-	}
-
-	// Parse the v2 payment payload
-	var v2Payload struct {
-		X402Version int                    `json:"x402Version"`
-		Payload     map[string]interface{} `json:"payload"`
-		Accepted    struct {
-			Scheme            string                 `json:"scheme"`
-			Network           string                 `json:"network"`
-			Asset             string                 `json:"asset"`
-			Amount            string                 `json:"amount"`
-			PayTo             string                 `json:"payTo"`
-			MaxTimeoutSeconds int                    `json:"maxTimeoutSeconds"`
-			Extra             map[string]interface{} `json:"extra,omitempty"`
-		} `json:"accepted"`
-	}
-	if err := json.Unmarshal(paymentBytes, &v2Payload); err != nil {
-		h.returnPaymentError(w, r, fmt.Sprintf("invalid payment payload: %v", err))
+	v1PaymentPayload, v1Requirements, payer, ok := h.decodeAndVerifyPayment(w, r, paymentHeader, route)
+	if !ok {
 		return
 	}
-
-	// Convert to v1 format for the facilitator
-	v1PaymentPayload := map[string]interface{}{
-		"x402Version": 1,
-		"scheme":      v2Payload.Accepted.Scheme,
-		"network":     v2Payload.Accepted.Network,
-		"payload":     v2Payload.Payload,
-	}
-
-	resourceURL := fmt.Sprintf("https://%s%s", r.Host, r.URL.Path)
-
-	// Use authorized value from signed payload as maxAmountRequired
-	maxAmount := v2Payload.Accepted.Amount
-	if authMap, ok := v2Payload.Payload["authorization"].(map[string]interface{}); ok {
-		if val, ok := authMap["value"].(string); ok {
-			maxAmount = val
-		}
-	}
-
-	extraJSON, err := json.Marshal(v2Payload.Accepted.Extra)
-	if err != nil {
-		slog.Warn("Failed to marshal extra JSON", "error", err)
-		h.returnPaymentError(w, r, "failed to process payment extra data")
-		return
-	}
-
-	v1Requirements := map[string]interface{}{
-		"scheme":            v2Payload.Accepted.Scheme,
-		"network":           v2Payload.Accepted.Network,
-		"maxAmountRequired": maxAmount,
-		"resource":          resourceURL,
-		"description":       route.Description,
-		"mimeType":          route.MimeType,
-		"payTo":             v2Payload.Accepted.PayTo,
-		"maxTimeoutSeconds": v2Payload.Accepted.MaxTimeoutSeconds,
-		"asset":             v2Payload.Accepted.Asset,
-		"extra":             json.RawMessage(extraJSON),
-	}
-
-	// Verify with facilitator
-	verifyReq := map[string]interface{}{
-		"x402Version":         1,
-		"paymentPayload":      v1PaymentPayload,
-		"paymentRequirements": v1Requirements,
-	}
-
-	verifyBody, err := json.Marshal(verifyReq)
-	if err != nil {
-		slog.Error("Failed to marshal verify request", "error", err)
-		h.returnPaymentError(w, r, "internal error")
-		return
-	}
-
-	slog.Info("Calling facilitator /verify",
-		"route", route.ID,
-		"facilitator", h.cfg.FacilitatorURL,
-		"network", v2Payload.Accepted.Network,
-	)
-
-	verifyResp, err := http.Post(h.cfg.FacilitatorURL+"/verify", "application/json", bytes.NewReader(verifyBody))
-	if err != nil {
-		slog.Error("Facilitator verify failed", "error", err)
-		h.returnPaymentError(w, r, "facilitator unavailable")
-		return
-	}
-	defer verifyResp.Body.Close()
-
-	verifyRespBody, err := io.ReadAll(verifyResp.Body)
-	if err != nil {
-		slog.Error("Failed to read verify response", "error", err)
-		h.returnPaymentError(w, r, "facilitator response unreadable")
-		return
-	}
-
-	slog.Info("Facilitator verify response", "status", verifyResp.StatusCode, "body", string(verifyRespBody))
-
-	var verifyResult struct {
-		IsValid        bool   `json:"isValid"`
-		InvalidReason  string `json:"invalidReason,omitempty"`
-		InvalidMessage string `json:"invalidMessage,omitempty"`
-		Payer          string `json:"payer,omitempty"`
-	}
-	if err := json.Unmarshal(verifyRespBody, &verifyResult); err != nil {
-		slog.Error("Failed to parse verify response", "error", err, "body", string(verifyRespBody))
-		h.returnPaymentError(w, r, "invalid facilitator response")
-		return
-	}
-
-	if verifyResp.StatusCode != http.StatusOK || !verifyResult.IsValid {
-		reason := verifyResult.InvalidReason
-		if reason == "" {
-			reason = "payment_invalid"
-		}
-		slog.Warn("Payment verification failed", "reason", reason, "message", verifyResult.InvalidMessage)
-		h.returnPaymentError(w, r, fmt.Sprintf("verification failed: %s - %s", reason, verifyResult.InvalidMessage))
-		return
-	}
-
-	// Payment verified! Settle with a bounded synchronous wait so we can
-	// carry a real on-chain tx hash in the feed402 envelope's receipt.tx.
-	// If settle exceeds the budget (facilitator slow / chain congestion),
-	// we continue the settle in the background and fall back to the
-	// "pending:<hash>" placeholder for this response — the payment is
-	// still valid, the receipt is just non-final until the next call.
 	txHash := h.settleWithTimeout(r.Context(), v1PaymentPayload, v1Requirements, 3*time.Second)
 
 	slog.Info("Payment verified, proxying to upstream",
 		"route", route.ID,
-		"payer", verifyResult.Payer,
+		"payer", payer,
 		"upstream", route.Upstream.BaseURL+route.Upstream.Path,
 	)
 
@@ -336,7 +255,7 @@ func (h *Handler) handlePaymentAndProxy(w http.ResponseWriter, r *http.Request, 
 	// Return upstream response with payment metadata headers
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Research-Route", route.ID)
-	w.Header().Set("X-Research-Payer", verifyResult.Payer)
+	w.Header().Set("X-Research-Payer", payer)
 	if txHash != "" {
 		w.Header().Set("X-Research-Transaction", txHash)
 	}
@@ -346,7 +265,7 @@ func (h *Handler) handlePaymentAndProxy(w http.ResponseWriter, r *http.Request, 
 	// unchanged so agents still see useful upstream error messages.
 	respBody := result.Body
 	if h.cfg.Feed402.Enabled && result.StatusCode >= 200 && result.StatusCode < 300 {
-		wrapped, werr := h.wrapFeed402Envelope(route, result.Body, verifyResult.Payer, txHash, r)
+		wrapped, werr := h.wrapFeed402Envelope(route, result.Body, payer, txHash, r)
 		if werr != nil {
 			slog.Warn("feed402 envelope wrap failed, returning raw upstream body",
 				"route", route.ID, "error", werr)
@@ -375,6 +294,115 @@ func (h *Handler) returnPaymentError(w http.ResponseWriter, r *http.Request, _ s
 		}
 	}
 	w.WriteHeader(http.StatusPaymentRequired)
+}
+
+// decodeAndVerifyPayment parses the x402 v2 payment envelope, calls the
+// facilitator /verify endpoint, and returns the inner v1 payment payload +
+// requirements + payer on success. On any failure it writes an error
+// response to w and returns ok=false. Shared by handlePaymentAndProxy
+// (for regular proxied routes) and handleInsight (for the synthetic
+// feed402 insight-tier route).
+func (h *Handler) decodeAndVerifyPayment(
+	w http.ResponseWriter, r *http.Request, paymentHeader string, route *config.RouteConfig,
+) (v1Payload map[string]interface{}, v1Requirements map[string]interface{}, payer string, ok bool) {
+	paymentBytes, err := base64.StdEncoding.DecodeString(paymentHeader)
+	if err != nil {
+		paymentBytes, err = base64.URLEncoding.DecodeString(paymentHeader)
+		if err != nil {
+			h.returnPaymentError(w, r, "invalid payment header encoding")
+			return nil, nil, "", false
+		}
+	}
+	var v2Payload struct {
+		X402Version int                    `json:"x402Version"`
+		Payload     map[string]interface{} `json:"payload"`
+		Accepted    struct {
+			Scheme            string                 `json:"scheme"`
+			Network           string                 `json:"network"`
+			Asset             string                 `json:"asset"`
+			Amount            string                 `json:"amount"`
+			PayTo             string                 `json:"payTo"`
+			MaxTimeoutSeconds int                    `json:"maxTimeoutSeconds"`
+			Extra             map[string]interface{} `json:"extra,omitempty"`
+		} `json:"accepted"`
+	}
+	if err := json.Unmarshal(paymentBytes, &v2Payload); err != nil {
+		h.returnPaymentError(w, r, fmt.Sprintf("invalid payment payload: %v", err))
+		return nil, nil, "", false
+	}
+
+	v1Payload = map[string]interface{}{
+		"x402Version": 1,
+		"scheme":      v2Payload.Accepted.Scheme,
+		"network":     v2Payload.Accepted.Network,
+		"payload":     v2Payload.Payload,
+	}
+
+	resourceURL := fmt.Sprintf("https://%s%s", r.Host, r.URL.Path)
+	maxAmount := v2Payload.Accepted.Amount
+	if authMap, ok2 := v2Payload.Payload["authorization"].(map[string]interface{}); ok2 {
+		if val, ok3 := authMap["value"].(string); ok3 {
+			maxAmount = val
+		}
+	}
+	extraJSON, err := json.Marshal(v2Payload.Accepted.Extra)
+	if err != nil {
+		h.returnPaymentError(w, r, "failed to process payment extra data")
+		return nil, nil, "", false
+	}
+	v1Requirements = map[string]interface{}{
+		"scheme":            v2Payload.Accepted.Scheme,
+		"network":           v2Payload.Accepted.Network,
+		"maxAmountRequired": maxAmount,
+		"resource":          resourceURL,
+		"description":       route.Description,
+		"mimeType":          route.MimeType,
+		"payTo":             v2Payload.Accepted.PayTo,
+		"maxTimeoutSeconds": v2Payload.Accepted.MaxTimeoutSeconds,
+		"asset":             v2Payload.Accepted.Asset,
+		"extra":             json.RawMessage(extraJSON),
+	}
+
+	verifyReq := map[string]interface{}{
+		"x402Version":         1,
+		"paymentPayload":      v1Payload,
+		"paymentRequirements": v1Requirements,
+	}
+	verifyBody, err := json.Marshal(verifyReq)
+	if err != nil {
+		h.returnPaymentError(w, r, "internal error")
+		return nil, nil, "", false
+	}
+	verifyResp, err := http.Post(h.cfg.FacilitatorURL+"/verify", "application/json", bytes.NewReader(verifyBody))
+	if err != nil {
+		h.returnPaymentError(w, r, "facilitator unavailable")
+		return nil, nil, "", false
+	}
+	defer verifyResp.Body.Close()
+	verifyRespBody, err := io.ReadAll(verifyResp.Body)
+	if err != nil {
+		h.returnPaymentError(w, r, "facilitator response unreadable")
+		return nil, nil, "", false
+	}
+	var verifyResult struct {
+		IsValid        bool   `json:"isValid"`
+		InvalidReason  string `json:"invalidReason,omitempty"`
+		InvalidMessage string `json:"invalidMessage,omitempty"`
+		Payer          string `json:"payer,omitempty"`
+	}
+	if err := json.Unmarshal(verifyRespBody, &verifyResult); err != nil {
+		h.returnPaymentError(w, r, "invalid facilitator response")
+		return nil, nil, "", false
+	}
+	if verifyResp.StatusCode != http.StatusOK || !verifyResult.IsValid {
+		reason := verifyResult.InvalidReason
+		if reason == "" {
+			reason = "payment_invalid"
+		}
+		h.returnPaymentError(w, r, fmt.Sprintf("verification failed: %s - %s", reason, verifyResult.InvalidMessage))
+		return nil, nil, "", false
+	}
+	return v1Payload, v1Requirements, payer, true
 }
 
 // settleWithTimeout calls the facilitator /settle endpoint with a bounded

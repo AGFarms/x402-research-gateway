@@ -54,6 +54,31 @@ type Feed402Config struct {
 	Spec           string `yaml:"spec"`           // e.g. "feed402/0.2"
 	CitationPolicy string `yaml:"citationPolicy"` // umbrella license for this provider
 	Contact        string `yaml:"contact"`
+	// Insight (optional) turns on the feed402 insight-tier endpoint. When
+	// enabled the gateway registers a POST handler at Insight.Path that
+	// accepts {question}, fans out to a configured retrieval route for
+	// context, calls an LLM summarizer, and wraps the result in the §3
+	// envelope with tier="insight".
+	Insight InsightConfig `yaml:"insight"`
+}
+
+// InsightConfig configures the gateway's insight tier endpoint.
+type InsightConfig struct {
+	Enabled          bool   `yaml:"enabled"`
+	Path             string `yaml:"path"`             // e.g. "/research/insight"
+	Price            string `yaml:"price"`            // feed402 SPEC: insight is cheapest
+	Description      string `yaml:"description"`
+	// RetrievalRouteID picks which existing search route the insight
+	// handler fans out to for context. Must match a route.ID in Routes.
+	RetrievalRouteID string `yaml:"retrievalRouteId"`
+	// Summarizer: "mock" | "openai". Defaults to "mock" when the
+	// OPENAI_API_KEY env var is not set so the gateway boots without keys.
+	Summarizer string `yaml:"summarizer"`
+	// Model: e.g. "gpt-4o-mini". Only used when Summarizer="openai".
+	Model string `yaml:"model"`
+	// MaxContextChars caps how much retrieval text is sent to the LLM to
+	// bound cost; default 4000 (~1000 tokens).
+	MaxContextChars int `yaml:"maxContextChars"`
 }
 
 // RouteConfig defines a single x402-protected research API route.
@@ -192,6 +217,30 @@ func LoadFromFile(path string) (*GatewayConfig, error) {
 		}
 		if cfg.Feed402.CitationPolicy == "" {
 			cfg.Feed402.CitationPolicy = "mixed"
+		}
+		if cfg.Feed402.Insight.Enabled {
+			if cfg.Feed402.Insight.Path == "" {
+				cfg.Feed402.Insight.Path = "/research/insight"
+			}
+			if cfg.Feed402.Insight.Price == "" {
+				cfg.Feed402.Insight.Price = "0.005"
+			}
+			if cfg.Feed402.Insight.Description == "" {
+				cfg.Feed402.Insight.Description = "LLM-summarized research insight over paid retrieval"
+			}
+			if cfg.Feed402.Insight.Summarizer == "" {
+				if os.Getenv("OPENAI_API_KEY") != "" {
+					cfg.Feed402.Insight.Summarizer = "openai"
+				} else {
+					cfg.Feed402.Insight.Summarizer = "mock"
+				}
+			}
+			if cfg.Feed402.Insight.Model == "" {
+				cfg.Feed402.Insight.Model = "gpt-4o-mini"
+			}
+			if cfg.Feed402.Insight.MaxContextChars == 0 {
+				cfg.Feed402.Insight.MaxContextChars = 4000
+			}
 		}
 	}
 
