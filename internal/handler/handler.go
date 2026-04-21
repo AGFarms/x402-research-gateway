@@ -17,7 +17,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 
-	"github.com/viatika-ai/x402-research-gateway/internal/config"
+	"github.com/gianyrox/x402-research-gateway/internal/config"
 )
 
 // Handler handles x402-protected research API requests.

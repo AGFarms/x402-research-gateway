@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/viatika-ai/x402-research-gateway/internal/config"
+	"github.com/gianyrox/x402-research-gateway/internal/config"
 )
 
 // newTestHandler returns a Handler with only the fields the feed402 layer

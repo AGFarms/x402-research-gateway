@@ -1,4 +1,4 @@
-module github.com/viatika-ai/x402-research-gateway
+module github.com/gianyrox/x402-research-gateway
 
 go 1.24.4
 

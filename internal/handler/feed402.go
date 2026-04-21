@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/viatika-ai/x402-research-gateway/internal/config"
+	"github.com/gianyrox/x402-research-gateway/internal/config"
 )
 
 // ---------- Manifest types (mirror feed402 SPEC §1) ----------
